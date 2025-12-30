@@ -70,5 +70,5 @@ All changes are **idempotent** and safe to re-run.
 Clone the repository:
 
 ```bash
-git clone https://github.com/<your-username>/linux-on-intel-mac.git
+git clone https://github.com/youngvz/linux-on-intel-mac.git
 cd linux-on-intel-mac
