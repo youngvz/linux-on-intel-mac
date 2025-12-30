@@ -2,22 +2,26 @@
 # macmini-ubuntu-fixes.sh
 #
 # Purpose:
-#   Apply the boot-stability + boot-time tweaks we implemented for Ubuntu 22.04
-#   running from an external SSD on a 2018 Intel Mac mini (T2/Apple EFI).
+#   Apply boot-stability + boot-time tweaks for Ubuntu on Intel Macs (T2/Apple EFI),
+#   especially when booting from an external SSD and dealing with Apple EFI quirks.
 #
 # What this script does:
 #   - Masks systemd-rfkill (prevents RF Kill state persistence failures)
-#   - Removes Plymouth (prevents VT blinking / boot log hijacking)
+#   - Masks + purges Plymouth (prevents VT stealing / blinking / boot hijack)
 #   - Disables NetworkManager-wait-online (removes long boot delays)
 #   - Masks systemd-udev-settle (avoid unnecessary boot waiting)
-#   - Disables snapd socket + stops snapd, optionally purges snapd (you already did)
 #   - Enables fstrim.timer (SSD maintenance)
-#   - Optionally updates GRUB kernel args (keeps your existing args, removes quiet/splash)
+#   - Disables snapd.socket + stops snapd (optionally purges snapd)
 #
-# Safe/idempotent: re-running should be fine.
+# What this script intentionally does NOT do:
+#   - It does NOT modify GRUB. On Intel Macs + eGPU, kernel args are fragile and
+#     should be edited manually and documented in the repo.
 #
 # Usage:
 #   sudo bash macmini-ubuntu-fixes.sh
+#
+# Optional:
+#   PURGE_SNAPD=1 sudo bash macmini-ubuntu-fixes.sh
 #
 set -euo pipefail
 
@@ -29,7 +33,12 @@ if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   die "Run as root: sudo bash $0"
 fi
 
-log "Starting: Mac mini external-SSD Ubuntu stabilization + boot-time tuning"
+PURGE_SNAPD="${PURGE_SNAPD:-0}"
+
+log "Starting: Intel Mac Ubuntu stabilization + boot-time tuning"
+
+# Track actions for a quick summary
+declare -a CHANGES=()
 
 # -----------------------------
 # 1) rfkill persistence: disable/mask
@@ -37,6 +46,7 @@ log "Starting: Mac mini external-SSD Ubuntu stabilization + boot-time tuning"
 log "Masking systemd-rfkill (prevents 'Load/Save RF Kill Switch Status' boot failure noise)"
 systemctl mask --now systemd-rfkill.service >/dev/null 2>&1 || true
 systemctl mask --now systemd-rfkill.socket  >/dev/null 2>&1 || true
+CHANGES+=("Masked systemd-rfkill.service + systemd-rfkill.socket")
 
 # -----------------------------
 # 2) Plymouth: disable/mask + purge
@@ -45,40 +55,48 @@ log "Masking Plymouth units (prevents VT stealing / blinking boot logs)"
 systemctl mask --now plymouth-start.service     >/dev/null 2>&1 || true
 systemctl mask --now plymouth-quit.service      >/dev/null 2>&1 || true
 systemctl mask --now plymouth-quit-wait.service >/dev/null 2>&1 || true
+CHANGES+=("Masked Plymouth units")
 
-log "Purging Plymouth packages (safe on Ubuntu desktop; removes splash)"
+log "Purging Plymouth packages (removes splash; helps avoid early-boot VT weirdness)"
 apt-get update -y >/dev/null 2>&1 || true
 apt-get purge -y plymouth plymouth-theme-ubuntu-text plymouth-theme-spinner >/dev/null 2>&1 || true
 apt-get autoremove -y >/dev/null 2>&1 || true
+CHANGES+=("Purged plymouth + themes (best-effort)")
 
 # -----------------------------
 # 3) Boot time: disable wait-online
 # -----------------------------
 log "Disabling NetworkManager-wait-online (removes unnecessary boot blocking)"
 systemctl disable --now NetworkManager-wait-online.service >/dev/null 2>&1 || true
+CHANGES+=("Disabled NetworkManager-wait-online.service")
 
 # -----------------------------
-# 4) Boot time: mask udev settle (often pointless on desktops)
+# 4) Boot time: mask udev settle
 # -----------------------------
-log "Masking systemd-udev-settle (avoid blocking boot on device settle)"
+log "Masking systemd-udev-settle (avoid blocking boot waiting for 'settle')"
 systemctl mask --now systemd-udev-settle.service >/dev/null 2>&1 || true
+CHANGES+=("Masked systemd-udev-settle.service")
 
 # -----------------------------
-# 5) Snap: disable socket + optionally purge snapd
+# 5) Snap: disable socket + stop service
+#     Optional purge to avoid surprises on desktops
 # -----------------------------
 log "Disabling snapd.socket (prevents early snap namespace/mount churn)"
 systemctl disable --now snapd.socket >/dev/null 2>&1 || true
 systemctl stop snapd.service >/dev/null 2>&1 || true
+CHANGES+=("Disabled snapd.socket and stopped snapd.service (best-effort)")
 
-# You said you purged snapd already. We'll attempt it anyway safely.
-log "Purging snapd (no-op if already removed)"
-apt-get purge -y snapd >/dev/null 2>&1 || true
-apt-get autoremove -y >/dev/null 2>&1 || true
+if [[ "$PURGE_SNAPD" == "1" ]]; then
+  warn "PURGE_SNAPD=1 set: purging snapd packages + removing leftover directories"
+  apt-get purge -y snapd >/dev/null 2>&1 || true
+  apt-get autoremove -y >/dev/null 2>&1 || true
 
-# Clean snap leftovers if any remain
-if [[ -d /snap || -d /var/snap || -d /var/lib/snapd ]]; then
-  log "Removing leftover snap directories (if present)"
-  rm -rf /snap /var/snap /var/lib/snapd 2>/dev/null || true
+  if [[ -d /snap || -d /var/snap || -d /var/lib/snapd ]]; then
+    rm -rf /snap /var/snap /var/lib/snapd 2>/dev/null || true
+  fi
+  CHANGES+=("Purged snapd + removed /snap, /var/snap, /var/lib/snapd (best-effort)")
+else
+  warn "Skipping snapd purge (set PURGE_SNAPD=1 to remove snapd entirely)"
 fi
 
 # -----------------------------
@@ -86,62 +104,34 @@ fi
 # -----------------------------
 log "Enabling fstrim.timer (helps SSD performance over time)"
 systemctl enable --now fstrim.timer >/dev/null 2>&1 || true
+CHANGES+=("Enabled fstrim.timer")
 
 # -----------------------------
-# 7) Optional GRUB hygiene:
-#    - Remove quiet/splash (if present)
-#    - Ensure stable external-SSD boot args remain intact
-#    - Add usbcore.autosuspend=-1 (common Mac USB stability win)
-#    NOTE: We DO NOT remove your existing PCI flags.
+# 7) GRUB: do NOT touch
 # -----------------------------
-GRUB_FILE="/etc/default/grub"
-if [[ -f "$GRUB_FILE" ]]; then
-  log "Updating GRUB defaults (remove quiet/splash; add usbcore.autosuspend=-1 if missing)"
-  cp -a "$GRUB_FILE" "${GRUB_FILE}.bak.$(date +%Y%m%d_%H%M%S)"
-
-  # Read current GRUB_CMDLINE_LINUX_DEFAULT value (best-effort)
-  current="$(grep -E '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUB_FILE" | head -n1 || true)"
-
-  if [[ -z "$current" ]]; then
-    warn "GRUB_CMDLINE_LINUX_DEFAULT not found; skipping GRUB_CMDLINE edits."
-  else
-    # Extract content between quotes (handles simple quoted values)
-    cmdline="$(printf "%s" "$current" | sed -E 's/^GRUB_CMDLINE_LINUX_DEFAULT="(.*)"/\1/')"
-
-    # Remove quiet/splash if present
-    cmdline="$(echo "$cmdline" | sed -E 's/\bquiet\b//g; s/\bsplash\b//g' | tr -s ' ')"
-    cmdline="$(echo "$cmdline" | sed -E 's/^ +| +$//g')"
-
-    # Add usbcore.autosuspend=-1 if missing (helps external USB storage on Macs)
-    if ! echo "$cmdline" | grep -q 'usbcore\.autosuspend=-1'; then
-      cmdline="$cmdline usbcore.autosuspend=-1"
-    fi
-
-    # Write back
-    # Use a conservative replace of the line.
-    sed -i -E "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"${cmdline}\"|g" "$GRUB_FILE"
-
-    log "Regenerating GRUB config"
-    update-grub >/dev/null
-  fi
-else
-  warn "/etc/default/grub not found; skipping GRUB updates."
-fi
+warn "GRUB NOT modified by this script."
+warn "On Intel Macs + eGPU, keep kernel args manual + documented (recommended)."
 
 # -----------------------------
 # 8) Final status summary
 # -----------------------------
-log "Done. Quick status summary:"
-echo "---- failed units ----"
+log "Done. Changes applied:"
+for c in "${CHANGES[@]}"; do
+  echo "  - $c"
+done
+
+echo
+echo "---- failed units (if any) ----"
 systemctl --failed || true
+
 echo
 echo "---- key unit states ----"
-systemctl is-enabled NetworkManager-wait-online.service 2>/dev/null || true
-systemctl is-enabled snapd.socket 2>/dev/null || true
-systemctl is-enabled fstrim.timer 2>/dev/null || true
-systemctl status systemd-rfkill.service --no-pager 2>/dev/null | sed -n '1,6p' || true
-echo
+echo -n "NetworkManager-wait-online: "; systemctl is-enabled NetworkManager-wait-online.service 2>/dev/null || true
+echo -n "snapd.socket: ";             systemctl is-enabled snapd.socket 2>/dev/null || true
+echo -n "fstrim.timer: ";             systemctl is-enabled fstrim.timer 2>/dev/null || true
+echo -n "systemd-rfkill.service: ";   systemctl is-enabled systemd-rfkill.service 2>/dev/null || true
+
 log "Recommended: reboot now to validate a clean, fast boot."
-echo "Run after reboot:"
+echo "After reboot, run:"
 echo "  systemd-analyze"
 echo "  systemd-analyze critical-chain"
